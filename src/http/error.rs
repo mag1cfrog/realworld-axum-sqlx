@@ -40,7 +40,9 @@ pub enum Error {
     /// that the frontend could infer the error from the status code alone.
     #[error("error in the request body")]
     UnprocessableEntity {
-        errors: HashMap<Cow<'static, str>, Vec<Cow<'static, str>>>,
+        // Named with an underscore-prefix because `thiserror`'s derived impls pattern-match
+        // and bind this field even when it isn't needed for formatting.
+        _errors: HashMap<Cow<'static, str>, Vec<Cow<'static, str>>>,
     },
 
     /// Automatically return `500 Internal Server Error` on a `sqlx::Error`.
@@ -97,7 +99,7 @@ impl Error {
                 .push(val.into());
         }
 
-        Self::UnprocessableEntity { errors: error_map }
+        Self::UnprocessableEntity { _errors: error_map }
     }
 
     fn status_code(&self) -> StatusCode {
@@ -122,7 +124,7 @@ impl IntoResponse for Error {
 
     fn into_response(self) -> Response<Self::Body> {
         match self {
-            Self::UnprocessableEntity { errors } => {
+            Self::UnprocessableEntity { _errors: errors } => {
                 #[derive(serde::Serialize)]
                 struct Errors {
                     errors: HashMap<Cow<'static, str>, Vec<Cow<'static, str>>>,
