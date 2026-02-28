@@ -5,7 +5,6 @@ use futures::TryStreamExt;
 use crate::http;
 use crate::http::articles::{Article, ArticleFromQuery};
 use crate::http::extractor::{AuthUser, MaybeAuthUser};
-use crate::http::types::Timestamptz;
 use crate::http::ApiContext;
 
 #[derive(serde::Deserialize, Default)]
@@ -82,8 +81,15 @@ pub(in crate::http) async fn list_articles(
     ctx: Extension<ApiContext>,
     query: Query<ListArticlesQuery>,
 ) -> http::Result<Json<MultipleArticlesBody>> {
-    let articles: Vec<_> = sqlx::query_as!(
-        ArticleFromQuery,
+    let ListArticlesQuery {
+        tag,
+        author,
+        favorited,
+        limit,
+        offset,
+    } = query.0;
+
+    let articles: Vec<_> = sqlx::query_as::<_, ArticleFromQuery>(
         // language=PostgreSQL
         r#"
             select
@@ -92,19 +98,19 @@ pub(in crate::http) async fn list_articles(
                 description,
                 body,
                 tag_list,
-                article.created_at "created_at: Timestamptz",
-                article.updated_at "updated_at: Timestamptz",
-                exists(select 1 from article_favorite where user_id = $1) "favorited!",
+                article.created_at,
+                article.updated_at,
+                exists(select 1 from article_favorite where user_id = $1) as favorited,
                 coalesce(
                     -- `count(*)` returns `NULL` if the query returned zero columns
                     -- not exactly a fan of that design choice but whatever
                     (select count(*) from article_favorite fav where fav.article_id = article.article_id),
                     0
-                ) "favorites_count!",
+                ) as favorites_count,
                 author.username author_username,
                 author.bio author_bio,
                 author.image author_image,
-                exists(select 1 from follow where followed_user_id = author.user_id and following_user_id = $1) "following_author!"
+                exists(select 1 from follow where followed_user_id = author.user_id and following_user_id = $1) as following_author
             from article
             inner join "user" author using (user_id)
             -- the current way to do conditional filtering in SQLx
@@ -131,13 +137,13 @@ pub(in crate::http) async fn list_articles(
             limit $5
             offset $6
         "#,
-        maybe_auth_user.user_id(),
-        query.tag,
-        query.author,
-        query.favorited,
-        query.limit.unwrap_or(20),
-        query.offset.unwrap_or(0)
     )
+        .bind(maybe_auth_user.user_id())
+        .bind(tag.as_deref())
+        .bind(author.as_deref())
+        .bind(favorited.as_deref())
+        .bind(limit.unwrap_or(20))
+        .bind(offset.unwrap_or(0))
         // We fetch a `Stream` this time so that we can map it on-the-fly
         // without collecting to an intermediate `Vec` first.
         .fetch(&ctx.db)
@@ -160,8 +166,9 @@ pub(in crate::http) async fn feed_articles(
     ctx: Extension<ApiContext>,
     query: Query<FeedArticlesQuery>,
 ) -> http::Result<Json<MultipleArticlesBody>> {
-    let articles: Vec<_> = sqlx::query_as!(
-        ArticleFromQuery,
+    let FeedArticlesQuery { limit, offset } = query.0;
+
+    let articles: Vec<_> = sqlx::query_as::<_, ArticleFromQuery>(
         // As a rule of thumb, you always want the most specific dataset to be your outermost
         // `SELECT` so the query planner does as little extraneous work as possible, and then
         // your joins are just fetching data related to rows you already know you're returning.
@@ -181,18 +188,18 @@ pub(in crate::http) async fn feed_articles(
                 description,
                 body,
                 tag_list,
-                article.created_at "created_at: Timestamptz",
-                article.updated_at "updated_at: Timestamptz",
-                exists(select 1 from article_favorite where user_id = $1) "favorited!",
+                article.created_at,
+                article.updated_at,
+                exists(select 1 from article_favorite where user_id = $1) as favorited,
                 coalesce(
                     (select count(*) from article_favorite fav where fav.article_id = article.article_id),
                     0
-                ) "favorites_count!",
+                ) as favorites_count,
                 author.username author_username,
                 author.bio author_bio,
                 author.image author_image,
                 -- we wouldn't be returning this otherwise
-                true "following_author!"
+                true as following_author
             from follow
             inner join article on followed_user_id = article.user_id
             inner join "user" author using (user_id)
@@ -200,10 +207,10 @@ pub(in crate::http) async fn feed_articles(
             limit $2
             offset $3
         "#,
-        auth_user.user_id,
-        query.limit.unwrap_or(20),
-        query.offset.unwrap_or(0)
     )
+        .bind(auth_user.user_id)
+        .bind(limit.unwrap_or(20))
+        .bind(offset.unwrap_or(0))
         .fetch(&ctx.db)
         .map_ok(ArticleFromQuery::into_article)
         .try_collect()

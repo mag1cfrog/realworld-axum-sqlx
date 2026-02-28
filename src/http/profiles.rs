@@ -5,6 +5,7 @@ use crate::http::{Error, Result};
 use axum::extract::{Extension, Path};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use uuid::Uuid;
 
 // The `profiles` routes are very similar to the `users` routes, except they allow looking up
 // other users' data.
@@ -25,12 +26,20 @@ struct ProfileBody {
     profile: Profile,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, sqlx::FromRow)]
 pub struct Profile {
     pub username: String,
     pub bio: String,
     pub image: Option<String>,
     pub following: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct UserRow {
+    user_id: Uuid,
+    username: String,
+    bio: String,
+    image: Option<String>,
 }
 
 // https://realworld-docs.netlify.app/docs/specs/backend-specs/endpoints#get-profile
@@ -48,8 +57,7 @@ async fn get_user_profile(
 ) -> Result<Json<ProfileBody>> {
     // Since our query columns directly match an existing struct definition,
     // we can use `query_as!()` and save a bit of manual mapping.
-    let profile = sqlx::query_as!(
-        Profile,
+    let profile: Profile = sqlx::query_as(
         r#"
             select
                 username,
@@ -58,13 +66,13 @@ async fn get_user_profile(
                 exists(
                     select 1 from follow 
                     where followed_user_id = "user".user_id and following_user_id = $2
-                ) "following!" -- This tells SQLx that this column will never be null
+                ) as following
             from "user"
             where username = $1
         "#,
-        username,
-        maybe_auth_user.user_id()
     )
+    .bind(&username)
+    .bind(maybe_auth_user.user_id())
     .fetch_optional(&ctx.db)
     .await?
     .ok_or(Error::NotFound)?;
@@ -100,20 +108,19 @@ async fn follow_user(
     // If an error occurs, this transaction will be rolled back on-drop.
     let mut tx = ctx.db.begin().await?;
 
-    let user = sqlx::query!(
-        r#"select user_id, username, bio, image from "user" where username = $1"#,
-        username
-    )
-    .fetch_optional(&mut tx)
-    .await?
-    .ok_or(Error::NotFound)?;
+    let user: UserRow =
+        sqlx::query_as(r#"select user_id, username, bio, image from "user" where username = $1"#)
+            .bind(&username)
+            .fetch_optional(&mut tx)
+            .await?
+            .ok_or(Error::NotFound)?;
 
-    sqlx::query!(
+    sqlx::query(
         "insert into follow(following_user_id, followed_user_id) values ($1, $2) \
          on conflict do nothing", // If the row already exists, we don't need to do anything.
-        auth_user.user_id,
-        user.user_id
     )
+    .bind(auth_user.user_id)
+    .bind(user.user_id)
     .execute(&mut tx)
     .await
     // Handle this check constraint
@@ -143,21 +150,18 @@ async fn unfollow_user(
 
     let mut tx = ctx.db.begin().await?;
 
-    let user = sqlx::query!(
-        r#"select user_id, username, bio, image from "user" where username = $1"#,
-        username
-    )
-    .fetch_optional(&mut tx)
-    .await?
-    .ok_or(Error::NotFound)?;
+    let user: UserRow =
+        sqlx::query_as(r#"select user_id, username, bio, image from "user" where username = $1"#)
+            .bind(&username)
+            .fetch_optional(&mut tx)
+            .await?
+            .ok_or(Error::NotFound)?;
 
-    sqlx::query!(
-        "delete from follow where following_user_id = $1 and followed_user_id = $2",
-        auth_user.user_id,
-        user.user_id
-    )
-    .execute(&mut tx)
-    .await?;
+    sqlx::query("delete from follow where following_user_id = $1 and followed_user_id = $2")
+        .bind(auth_user.user_id)
+        .bind(user.user_id)
+        .execute(&mut tx)
+        .await?;
 
     // IMPORTANT! Without this, the changes we just made will be dropped.
     tx.commit().await?;

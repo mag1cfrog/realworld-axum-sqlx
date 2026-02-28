@@ -3,6 +3,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use itertools::Itertools;
 use sqlx::{Executor, Postgres};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::http::extractor::{AuthUser, MaybeAuthUser};
@@ -92,14 +93,15 @@ struct Article {
 //
 // It's a good chunk of boilerplate but thankfully you usually only have to write it a few
 // times across a whole project.
+#[derive(sqlx::FromRow)]
 struct ArticleFromQuery {
     slug: String,
     title: String,
     description: String,
     body: String,
     tag_list: Vec<String>,
-    created_at: Timestamptz,
-    updated_at: Timestamptz,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
     favorited: bool,
     favorites_count: i64,
     author_username: String,
@@ -119,8 +121,8 @@ impl ArticleFromQuery {
             description: self.description,
             body: self.body,
             tag_list: self.tag_list,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
+            created_at: Timestamptz(self.created_at),
+            updated_at: Timestamptz(self.updated_at),
             favorited: self.favorited,
             favorites_count: self.favorites_count,
             author: Profile {
@@ -137,9 +139,16 @@ impl ArticleFromQuery {
 async fn create_article(
     auth_user: AuthUser,
     ctx: Extension<ApiContext>,
-    Json(mut req): Json<ArticleBody<CreateArticle>>,
+    Json(req): Json<ArticleBody<CreateArticle>>,
 ) -> Result<Json<ArticleBody>> {
-    let slug = slugify(&req.article.title);
+    let CreateArticle {
+        title,
+        description,
+        body,
+        mut tag_list,
+    } = req.article;
+
+    let slug = slugify(&title);
 
     // Never specified unless you count just showing them sorted in the examples:
     // https://realworld-docs.netlify.app/docs/specs/backend-specs/api-response-format#single-article
@@ -147,11 +156,10 @@ async fn create_article(
     // However, it is required by the Postman collection. To their credit, the Realworld authors
     // have acknowledged this oversight and are willing to loosen the requirement:
     // https://github.com/gothinkster/realworld/issues/839#issuecomment-1002806224
-    req.article.tag_list.sort();
+    tag_list.sort();
 
     // For fun, this is how we combine several operations into a single query for brevity.
-    let article = sqlx::query_as!(
-        ArticleFromQuery,
+    let article: ArticleFromQuery = sqlx::query_as(
         // language=PostgreSQL
         r#"
             with inserted_article as (
@@ -163,32 +171,31 @@ async fn create_article(
                     description, 
                     body, 
                     tag_list, 
-                    -- This is how you can override the inferred type of a column.
-                    created_at "created_at: Timestamptz", 
-                    updated_at "updated_at: Timestamptz"
+                    created_at,
+                    updated_at
             )
             select 
                 inserted_article.*,
-                false "favorited!",
-                0::int8 "favorites_count!",
+                false as favorited,
+                0::int8 as favorites_count,
                 username author_username,
                 bio author_bio,
                 image author_image,
                 -- user is forbidden to follow themselves
-                false "following_author!"
+                false as following_author
             from inserted_article
             inner join "user" on user_id = $1
         "#,
-        auth_user.user_id,
-        slug,
-        req.article.title,
-        req.article.description,
-        req.article.body,
-        // The typechecking code that SQLx emits for parameters sometimes chokes on vectors.
-        // This slicing operation shouldn't be required, but it took a mess of type-system
-        // hacks just to get the codegen this far.
-        &req.article.tag_list[..]
     )
+    .bind(auth_user.user_id)
+    .bind(&slug)
+    .bind(&title)
+    .bind(&description)
+    .bind(&body)
+    // The typechecking code that SQLx emits for parameters sometimes chokes on vectors.
+    // This slicing operation shouldn't be required, but it took a mess of type-system
+    // hacks just to get the codegen this far.
+    .bind(&tag_list[..])
     .fetch_one(&ctx.db)
     .await
     .on_constraint("article_slug_key", |_| {
@@ -211,12 +218,18 @@ async fn update_article(
 
     let new_slug = req.article.title.as_deref().map(slugify);
 
-    let article_meta = sqlx::query!(
+    #[derive(sqlx::FromRow)]
+    struct ArticleMetaRow {
+        article_id: Uuid,
+        user_id: Uuid,
+    }
+
+    let article_meta: ArticleMetaRow = sqlx::query_as(
         // This locks the `article` row for the duration of the transaction so we're
         // not interleaving this with other possible updates.
         "select article_id, user_id from article where slug = $1 for update",
-        slug
     )
+    .bind(&slug)
     .fetch_optional(&mut tx)
     .await?
     .ok_or(Error::NotFound)?;
@@ -234,8 +247,7 @@ async fn update_article(
     // I could also have folded the above permission check into the update, and have in the past,
     // but I think that's where it starts to get too confusing as it relies on the fact that CTEs
     // with `INSERT/UPDATE/DELETE` statements are executed even if they're not read from.
-    let article = sqlx::query_as!(
-        ArticleFromQuery,
+    let article = sqlx::query_as::<_, ArticleFromQuery>(
         // language=PostgreSQL
         r#"
             with updated_article as (
@@ -252,34 +264,34 @@ async fn update_article(
                     description,
                     body,
                     tag_list,
-                    article.created_at "created_at: Timestamptz",
-                    article.updated_at "updated_at: Timestamptz"
+                    article.created_at,
+                    article.updated_at
             )
             select
                 updated_article.*,
-                exists(select 1 from article_favorite where user_id = $6) "favorited!",
+                exists(select 1 from article_favorite where user_id = $6) as favorited,
                 coalesce(
                     (select count(*) from article_favorite fav where fav.article_id = $5),
                     0
-                ) "favorites_count!",
+                ) as favorites_count,
                 author.username author_username,
                 author.bio author_bio,
                 author.image author_image,
                 -- user not allowed to follow themselves
-                false "following_author!"
+                false as following_author
             from updated_article
             -- we've ensured the current user is the article's author so we can assume it here
             inner join "user" author on author.user_id = $6
         "#,
-        // In a query with a lot of bind parameters, it can be difficult to keep them all straight.
-        // There's an open proposal to improve this: https://github.com/launchbadge/sqlx/issues/875
-        new_slug,
-        req.article.title,
-        req.article.description,
-        req.article.body,
-        article_meta.article_id,
-        auth_user.user_id
     )
+    // In a query with a lot of bind parameters, it can be difficult to keep them all straight.
+    // There's an open proposal to improve this: https://github.com/launchbadge/sqlx/issues/875
+    .bind(new_slug.as_deref())
+    .bind(req.article.title)
+    .bind(req.article.description)
+    .bind(req.article.body)
+    .bind(article_meta.article_id)
+    .bind(auth_user.user_id)
     .fetch_one(&mut tx)
     .await
     .on_constraint("article_slug_key", |_| {
@@ -302,7 +314,13 @@ async fn delete_article(
     ctx: Extension<ApiContext>,
     Path(slug): Path<String>,
 ) -> Result<()> {
-    let result = sqlx::query!(
+    #[derive(sqlx::FromRow)]
+    struct DeleteArticleRow {
+        existed: bool,
+        deleted: bool,
+    }
+
+    let result: DeleteArticleRow = sqlx::query_as(
         // I like to use raw strings for most queries mainly because CLion doesn't try
         // to escape newlines.
         // language=PostgreSQL
@@ -323,13 +341,13 @@ async fn delete_article(
             )
             select
                 -- This will be `true` if the article existed before we deleted it.
-                exists(select 1 from article where slug = $1) "existed!",
+                exists(select 1 from article where slug = $1) as existed,
                 -- This will only be `true` if we actually deleted the article.
-                exists(select 1 from deleted_article) "deleted!"
+                exists(select 1 from deleted_article) as deleted
         "#,
-        slug,
-        auth_user.user_id
     )
+    .bind(&slug)
+    .bind(auth_user.user_id)
     .fetch_one(&ctx.db)
     .await?;
 
@@ -353,8 +371,7 @@ async fn get_article(
     ctx: Extension<ApiContext>,
     Path(slug): Path<String>,
 ) -> Result<Json<ArticleBody>> {
-    let article = sqlx::query_as!(
-        ArticleFromQuery,
+    let article = sqlx::query_as::<_, ArticleFromQuery>(
         // language=PostgreSQL
         r#"
             select
@@ -363,26 +380,26 @@ async fn get_article(
                 description,
                 body,
                 tag_list,
-                article.created_at "created_at: Timestamptz",
-                article.updated_at "updated_at: Timestamptz",
-                exists(select 1 from article_favorite where user_id = $1) "favorited!",
+                article.created_at,
+                article.updated_at,
+                exists(select 1 from article_favorite where user_id = $1) as favorited,
                 coalesce(
                     -- `count(*)` returns `NULL` if the query returned zero columns
                     -- not exactly a fan of that design choice but whatever
                     (select count(*) from article_favorite fav where fav.article_id = article.article_id),
                     0
-                ) "favorites_count!",
+                ) as favorites_count,
                 author.username author_username,
                 author.bio author_bio,
                 author.image author_image,
-                exists(select 1 from follow where followed_user_id = author.user_id and following_user_id = $1) "following_author!"
+                exists(select 1 from follow where followed_user_id = author.user_id and following_user_id = $1) as following_author
             from article
             inner join "user" author using (user_id)
             where slug = $2
         "#,
-        maybe_auth_user.user_id(),
-        slug
     )
+        .bind(maybe_auth_user.user_id())
+        .bind(&slug)
         .fetch_optional(&ctx.db)
         .await?
         .ok_or(Error::NotFound)?
@@ -405,7 +422,7 @@ async fn favorite_article(
     // to do this to `update_article()` as well, but I wanted to demonstrate how you can use
     // a CTE to implement that.
 
-    let article_id = sqlx::query_scalar!(
+    let article_id: Uuid = sqlx::query_scalar(
         r#"
             with selected_article as (
                 select article_id from article where slug = $1
@@ -419,9 +436,9 @@ async fn favorite_article(
             )
             select article_id from selected_article
         "#,
-        slug,
-        auth_user.user_id
     )
+    .bind(&slug)
+    .bind(auth_user.user_id)
     .fetch_optional(&ctx.db)
     .await?
     .ok_or(Error::NotFound)?;
@@ -442,7 +459,7 @@ async fn unfavorite_article(
     //
     // The Postman collection doesn't test that case.
 
-    let article_id = sqlx::query_scalar!(
+    let article_id: Uuid = sqlx::query_scalar(
         r#"
             with selected_article as (
                 select article_id from article where slug = $1
@@ -454,9 +471,9 @@ async fn unfavorite_article(
             )
             select article_id from selected_article
         "#,
-        slug,
-        auth_user.user_id
     )
+    .bind(&slug)
+    .bind(auth_user.user_id)
     .fetch_optional(&ctx.db)
     .await?
     .ok_or(Error::NotFound)?;
@@ -478,12 +495,12 @@ async fn get_tags(ctx: Extension<ApiContext>) -> Result<Json<TagsBody>> {
     // Alternatively you could store the unique list of tags as a materialized view that is
     // periodically refreshed, or cache the result of this query in application code,
     // or simply apply a global rate-limit to this route. Each has its tradeoffs.
-    let tags = sqlx::query_scalar!(
+    let tags: Vec<String> = sqlx::query_scalar(
         r#"
-            select distinct tag "tag!"
+            select distinct tag
             from article, unnest (article.tag_list) tags(tag)
             order by tag
-        "#
+        "#,
     )
     .fetch_all(&ctx.db)
     .await?;
@@ -503,8 +520,7 @@ async fn article_by_id(
     user_id: Uuid,
     article_id: Uuid,
 ) -> Result<Article> {
-    let article = sqlx::query_as!(
-        ArticleFromQuery,
+    let article = sqlx::query_as::<_, ArticleFromQuery>(
         // language=PostgreSQL
         r#"
             select
@@ -513,26 +529,26 @@ async fn article_by_id(
                 description,
                 body,
                 tag_list,
-                article.created_at "created_at: Timestamptz",
-                article.updated_at "updated_at: Timestamptz",
-                exists(select 1 from article_favorite where user_id = $1) "favorited!",
+                article.created_at,
+                article.updated_at,
+                exists(select 1 from article_favorite where user_id = $1) as favorited,
                 coalesce(
                     -- `count(*)` returns `NULL` if the query returned zero columns
                     -- not exactly a fan of that design choice but whatever
                     (select count(*) from article_favorite fav where fav.article_id = article.article_id),
                     0
-                ) "favorites_count!",
+                ) as favorites_count,
                 author.username author_username,
                 author.bio author_bio,
                 author.image author_image,
-                exists(select 1 from follow where followed_user_id = author.user_id and following_user_id = $1) "following_author!"
+                exists(select 1 from follow where followed_user_id = author.user_id and following_user_id = $1) as following_author
             from article
             inner join "user" author using (user_id)
             where article_id = $2
         "#,
-        user_id,
-        article_id
     )
+        .bind(user_id)
+        .bind(article_id)
         .fetch_optional(e)
         .await?
         .ok_or(Error::NotFound)?

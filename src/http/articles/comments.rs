@@ -8,6 +8,7 @@ use axum::routing::{delete, get};
 use axum::{Json, Router};
 use futures::TryStreamExt;
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 pub fn router() -> Router {
     // Unlike those in `listing`, these routes are fortunately all self-contained
@@ -48,6 +49,7 @@ struct Comment {
 }
 
 // Same thing as `ArticleFromQuery`
+#[derive(sqlx::FromRow)]
 struct CommentFromQuery {
     comment_id: i64,
     created_at: OffsetDateTime,
@@ -84,13 +86,13 @@ async fn get_article_comments(
     Path(slug): Path<String>,
 ) -> Result<Json<MultipleCommentsBody>> {
     // With this, we can return 404 if the article slug was not found.
-    let article_id = sqlx::query_scalar!("select article_id from article where slug = $1", slug)
+    let article_id: Uuid = sqlx::query_scalar("select article_id from article where slug = $1")
+        .bind(&slug)
         .fetch_optional(&ctx.db)
         .await?
         .ok_or(Error::NotFound)?;
 
-    let comments = sqlx::query_as!(
-        CommentFromQuery,
+    let comments = sqlx::query_as::<_, CommentFromQuery>(
         r#"
             select
                 comment_id,
@@ -100,15 +102,15 @@ async fn get_article_comments(
                 author.username author_username,
                 author.bio author_bio,
                 author.image author_image,
-                exists(select 1 from follow where followed_user_id = author.user_id and following_user_id = $1) "following_author!"
+                exists(select 1 from follow where followed_user_id = author.user_id and following_user_id = $1) as following_author
             from article_comment comment
             inner join "user" author using (user_id)
             where article_id = $2
             order by created_at
         "#,
-        maybe_auth_user.user_id(),
-        article_id
     )
+        .bind(maybe_auth_user.user_id())
+        .bind(article_id)
         .fetch(&ctx.db)
         .map_ok(CommentFromQuery::into_comment)
         .try_collect()
@@ -122,10 +124,9 @@ async fn add_comment(
     auth_user: AuthUser,
     ctx: Extension<ApiContext>,
     Path(slug): Path<String>,
-    req: Json<CommentBody<AddComment>>,
+    Json(req): Json<CommentBody<AddComment>>,
 ) -> Result<Json<CommentBody>> {
-    let comment = sqlx::query_as!(
-        CommentFromQuery,
+    let comment = sqlx::query_as::<_, CommentFromQuery>(
         r#"
             with inserted_comment as (
                 insert into article_comment(article_id, user_id, body)
@@ -142,14 +143,14 @@ async fn add_comment(
                 author.username author_username,
                 author.bio author_bio,
                 author.image author_image,
-                false "following_author!"
+                false as following_author
             from inserted_comment comment
             inner join "user" author on user_id = $1
         "#,
-        auth_user.user_id,
-        req.comment.body,
-        slug
     )
+    .bind(auth_user.user_id)
+    .bind(req.comment.body)
+    .bind(slug)
     .fetch_optional(&ctx.db)
     .await?
     // In this case, we know a comment should have been inserted unless the article slug
@@ -167,7 +168,13 @@ async fn delete_comment(
     Path((slug, comment_id)): Path<(String, i64)>,
 ) -> Result<()> {
     // Identical technique to `articles::delete_article()`
-    let result = sqlx::query!(
+    #[derive(sqlx::FromRow)]
+    struct DeleteCommentRow {
+        existed: bool,
+        deleted: bool,
+    }
+
+    let result: DeleteCommentRow = sqlx::query_as(
         r#"
             with deleted_comment as (
                 delete from article_comment
@@ -182,13 +189,13 @@ async fn delete_comment(
                     select 1 from article_comment
                     inner join article using (article_id)
                     where comment_id = $1 and slug = $2
-                ) "existed!",
-                exists(select 1 from deleted_comment) "deleted!"
+                ) as existed,
+                exists(select 1 from deleted_comment) as deleted
         "#,
-        comment_id,
-        slug,
-        auth_user.user_id
     )
+    .bind(comment_id)
+    .bind(&slug)
+    .bind(auth_user.user_id)
     .fetch_one(&ctx.db)
     .await?;
 

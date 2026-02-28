@@ -5,6 +5,7 @@ use argon2::{Argon2, PasswordHash};
 use axum::extract::Extension;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use uuid::Uuid;
 
 use crate::http::error::{Error, ResultExt};
 use crate::http::extractor::AuthUser;
@@ -56,6 +57,32 @@ struct User {
     image: Option<String>,
 }
 
+#[derive(sqlx::FromRow)]
+struct UserLoginRow {
+    user_id: Uuid,
+    email: String,
+    username: String,
+    bio: String,
+    image: Option<String>,
+    password_hash: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct CurrentUserRow {
+    email: String,
+    username: String,
+    bio: String,
+    image: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct UpdatedUserRow {
+    email: String,
+    username: String,
+    bio: String,
+    image: Option<String>,
+}
+
 // https://realworld-docs.netlify.app/docs/specs/backend-specs/endpoints#registration
 async fn create_user(
     ctx: Extension<ApiContext>,
@@ -68,13 +95,13 @@ async fn create_user(
     //
     // Sometimes queries just get too darn big, though. In that case it may be a good idea
     // to move the query to a separate module.
-    let user_id = sqlx::query_scalar!(
+    let user_id: Uuid = sqlx::query_scalar(
         // language=PostgreSQL
         r#"insert into "user" (username, email, password_hash) values ($1, $2, $3) returning user_id"#,
-        req.user.username,
-        req.user.email,
-        password_hash
     )
+    .bind(&req.user.username)
+    .bind(&req.user.email)
+    .bind(password_hash)
     .fetch_one(&ctx.db)
     .await
     .on_constraint("user_username_key", |_| {
@@ -100,13 +127,13 @@ async fn login_user(
     ctx: Extension<ApiContext>,
     Json(req): Json<UserBody<LoginUser>>,
 ) -> Result<Json<UserBody<User>>> {
-    let user = sqlx::query!(
+    let user: UserLoginRow = sqlx::query_as(
         r#"
             select user_id, email, username, bio, image, password_hash 
             from "user" where email = $1
         "#,
-        req.user.email,
     )
+    .bind(req.user.email)
     .fetch_optional(&ctx.db)
     .await?
     .ok_or(Error::unprocessable_entity([("email", "does not exist")]))?;
@@ -132,12 +159,11 @@ async fn get_current_user(
     auth_user: AuthUser,
     ctx: Extension<ApiContext>,
 ) -> Result<Json<UserBody<User>>> {
-    let user = sqlx::query!(
-        r#"select email, username, bio, image from "user" where user_id = $1"#,
-        auth_user.user_id
-    )
-    .fetch_one(&ctx.db)
-    .await?;
+    let user: CurrentUserRow =
+        sqlx::query_as(r#"select email, username, bio, image from "user" where user_id = $1"#)
+            .bind(auth_user.user_id)
+            .fetch_one(&ctx.db)
+            .await?;
 
     Ok(Json(UserBody {
         user: User {
@@ -175,7 +201,7 @@ async fn update_user(
         None
     };
 
-    let user = sqlx::query!(
+    let user: UpdatedUserRow = sqlx::query_as(
         // This is how we do optional updates of fields without needing a separate query for each.
         // language=PostgreSQL
         r#"
@@ -188,13 +214,13 @@ async fn update_user(
             where user_id = $6
             returning email, username, bio, image
         "#,
-        req.user.email,
-        req.user.username,
-        password_hash,
-        req.user.bio,
-        req.user.image,
-        auth_user.user_id
     )
+    .bind(req.user.email)
+    .bind(req.user.username)
+    .bind(password_hash)
+    .bind(req.user.bio)
+    .bind(req.user.image)
+    .bind(auth_user.user_id)
     .fetch_one(&ctx.db)
     .await
     .on_constraint("user_username_key", |_| {
