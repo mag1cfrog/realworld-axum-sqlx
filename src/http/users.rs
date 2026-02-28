@@ -244,7 +244,7 @@ async fn update_user(
 async fn hash_password(password: String) -> Result<String> {
     // Argon2 hashing is designed to be computationally intensive,
     // so we need to do this on a blocking thread.
-    Ok(tokio::task::spawn_blocking(move || -> Result<String> {
+    tokio::task::spawn_blocking(move || -> Result<String> {
         let salt = SaltString::generate(rand::thread_rng());
         Ok(
             PasswordHash::generate(Argon2::default(), password, salt.as_str())
@@ -253,11 +253,11 @@ async fn hash_password(password: String) -> Result<String> {
         )
     })
     .await
-    .context("panic in generating password hash")??)
+    .context("panic in generating password hash")?
 }
 
 async fn verify_password(password: String, password_hash: String) -> Result<()> {
-    Ok(tokio::task::spawn_blocking(move || -> Result<()> {
+    tokio::task::spawn_blocking(move || -> Result<()> {
         let hash = PasswordHash::new(&password_hash)
             .map_err(|e| anyhow::anyhow!("invalid password hash: {}", e))?;
 
@@ -268,5 +268,5 @@ async fn verify_password(password: String, password_hash: String) -> Result<()> 
             })
     })
     .await
-    .context("panic in verifying password hash")??)
+    .context("panic in verifying password hash")?
 }
